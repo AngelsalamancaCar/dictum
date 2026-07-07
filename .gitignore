@@ -1,0 +1,30 @@
+# Go
+api/bin/
+*.exe
+*.test
+
+# Python
+ml/.venv/
+ml/__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# Claude Code local state
+.claude/
+
+# Node
+web/node_modules/
+web/dist/
+
+# Env / secrets
+.env
+*.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Corpus archive is large and source-controlled separately from code history
+corpus_archive/embeddings.ndjson

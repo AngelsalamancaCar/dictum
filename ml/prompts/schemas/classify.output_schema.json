@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "classify_output",
+  "type": "object",
+  "required": ["case_type", "confidence", "evidence"],
+  "properties": {
+    "case_type": { "type": "string" },
+    "confidence": { "type": "string", "enum": ["alto", "medio", "bajo"] },
+    "evidence": {
+      "type": "array",
+      "items": { "type": "string" },
+      "minItems": 1
+    }
+  },
+  "additionalProperties": false
+}

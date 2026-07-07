@@ -1,0 +1,49 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: dictum
+      POSTGRES_PASSWORD: dictum
+      POSTGRES_DB: dictum
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dictum"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  ml:
+    build:
+      context: ./ml
+    environment:
+      DATABASE_URL: postgresql://dictum:dictum@postgres:5432/dictum
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./ml:/app
+      - ./corpus_archive:/corpus_archive:ro
+
+  api:
+    build:
+      context: ./api
+    environment:
+      DICTUM_API_ADDR: ":8080"
+      DATABASE_URL: postgresql://dictum:dictum@postgres:5432/dictum
+      ML_WORKER_URL: http://ml:8000
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ml:
+        condition: service_started
+
+volumes:
+  postgres_data:

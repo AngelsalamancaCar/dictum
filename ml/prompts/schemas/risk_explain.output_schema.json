@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "risk_explain_output",
+  "type": "object",
+  "required": ["similarities"],
+  "properties": {
+    "similarities": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["ruling_id", "explanation"],
+        "properties": {
+          "ruling_id": { "type": "string" },
+          "explanation": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

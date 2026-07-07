@@ -1,0 +1,62 @@
+{
+  "intfloat/multilingual-e5-large": {
+    "dimension": 1024,
+    "num_chunks": 2627,
+    "embed_seconds": 1284.1280010000337,
+    "chunks_per_second": 2.045746216852358,
+    "index_bytes_estimate": 10760192,
+    "neighbor_checks": [
+      {
+        "query_doc": "30-202.txt",
+        "query_excerpt": "2024, “Año de la Innovación y Modernización Judicial” SENTENCIA. SAN QUINTÍN, BAJA CALIFORNIA, A VEINTIOCHO DE AGOSTO DE",
+        "neighbor_doc": "67-202.txt",
+        "neighbor_excerpt": "2024, “Año de la Innovación y Modernización Judicial” SENTENCIA. SAN QUINTÍN, BAJA CALIFORNIA, A OCHO DE NOVIEMBRE DE DO",
+        "similarity": 0.9565383195877075
+      },
+      {
+        "query_doc": "SENTENCIA 252-202.txt",
+        "query_excerpt": "cfdi, con registros de asistencia electrónica semanal por el periodo del 28 de febrero de 2022 al 09 de octubre de 2022,",
+        "neighbor_doc": "SENTENCIA 1298-202.txt",
+        "neighbor_excerpt": "de pago, por los periodos comprendidos del 01 de enero al 30 de diciembre de 2022, no se presentaron en formato de Compr",
+        "similarity": 0.9532703161239624
+      },
+      {
+        "query_doc": "sentencia_98_2023.txt",
+        "query_excerpt": "EXPEDIENTE NÚMERO 98/2023 SENTENCIA CONDENATORIA CLAVE 8800 En los autos del Juicio Ordinario 98/2023 promovido por ****",
+        "neighbor_doc": "SENTENCIA 98-202.txt",
+        "neighbor_excerpt": "EXPEDIENTE NÚMERO 98/2023 SENTENCIA CONDENATORIA CLAVE 8800 En los autos del Juicio Ordinario 98/2023 promovido por ****",
+        "similarity": 0.9323662519454956
+      }
+    ]
+  },
+  "paraphrase-multilingual-mpnet-base-v2": {
+    "dimension": 768,
+    "num_chunks": 2627,
+    "embed_seconds": 82.51016300008632,
+    "chunks_per_second": 31.838502124850386,
+    "index_bytes_estimate": 8070144,
+    "neighbor_checks": [
+      {
+        "query_doc": "30-202.txt",
+        "query_excerpt": "2024, “Año de la Innovación y Modernización Judicial” SENTENCIA. SAN QUINTÍN, BAJA CALIFORNIA, A VEINTIOCHO DE AGOSTO DE",
+        "neighbor_doc": "67-202.txt",
+        "neighbor_excerpt": "2024, “Año de la Innovación y Modernización Judicial” SENTENCIA. SAN QUINTÍN, BAJA CALIFORNIA, A OCHO DE NOVIEMBRE DE DO",
+        "similarity": 0.9379320740699768
+      },
+      {
+        "query_doc": "SENTENCIA 252-202.txt",
+        "query_excerpt": "cfdi, con registros de asistencia electrónica semanal por el periodo del 28 de febrero de 2022 al 09 de octubre de 2022,",
+        "neighbor_doc": "Sentencia 854-24 Lic L Resc actor.txt",
+        "neighbor_excerpt": "salario diario integrado de $813.30 pesos, lo anterior, salvo prueba en contrario. 3.- Del análisis de la prueba de insp",
+        "similarity": 0.6939041018486023
+      },
+      {
+        "query_doc": "sentencia_98_2023.txt",
+        "query_excerpt": "EXPEDIENTE NÚMERO 98/2023 SENTENCIA CONDENATORIA CLAVE 8800 En los autos del Juicio Ordinario 98/2023 promovido por ****",
+        "neighbor_doc": "SENTENCIA 98-202.txt",
+        "neighbor_excerpt": "EXPEDIENTE NÚMERO 98/2023 SENTENCIA CONDENATORIA CLAVE 8800 En los autos del Juicio Ordinario 98/2023 promovido por ****",
+        "similarity": 1.0
+      }
+    ]
+  }
+}
