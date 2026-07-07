@@ -3,7 +3,7 @@ import tempfile
 from pathlib import Path
 from typing import Literal
 
-from fastapi import FastAPI, UploadFile
+from fastapi import FastAPI, HTTPException, UploadFile
 from pydantic import BaseModel
 
 from parsing.liteparse_service import parse_document
@@ -11,6 +11,7 @@ from rag.chunking import chunk_document
 from rag.embedding_service import embed_passages, embed_queries
 from rag.retrieval import Filters, hybrid_search
 from classify.knn import classify_by_knn
+from packager.bundle import build_bundle
 
 app = FastAPI(title="dictum-ml")
 
@@ -161,6 +162,26 @@ def risk_score():
     raise NotImplementedError
 
 
-@app.post("/package-build")
-def package_build():
-    raise NotImplementedError
+class PackageBuildRequest(BaseModel):
+    use_case: str
+    context: dict[str, object]
+    package_id: str | None = None
+
+
+class PackageBuildResponse(BaseModel):
+    package_id: str
+    use_case: str
+    prompt_version: int
+    created_at: str
+    prompt: str
+    context: dict[str, object]
+    output_schema: dict[str, object]
+
+
+@app.post("/package-build", response_model=PackageBuildResponse)
+def package_build(req: PackageBuildRequest):
+    try:
+        bundle = build_bundle(req.use_case, req.context, package_id=req.package_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return PackageBuildResponse(**bundle)

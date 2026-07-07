@@ -215,3 +215,31 @@ func (c *Client) ClassifyKNN(ctx context.Context, caseSummary string, k int) (Cl
 	err := c.postJSON(ctx, "/classify-knn", classifyKNNRequest{CaseSummary: caseSummary, K: k}, &out)
 	return out, err
 }
+
+type buildPackageRequest struct {
+	UseCase string         `json:"use_case"`
+	Context map[string]any `json:"context"`
+}
+
+// PackageBundle is a fully-assembled prepared package (plan.md §5): the
+// rendered prompt, the raw context it was rendered from, and the output
+// schema the harness response must satisfy. The API server persists this
+// verbatim into the packages.bundle jsonb column.
+type PackageBundle struct {
+	PackageID     string          `json:"package_id"`
+	UseCase       string          `json:"use_case"`
+	PromptVersion int             `json:"prompt_version"`
+	CreatedAt     string          `json:"created_at"`
+	Prompt        string          `json:"prompt"`
+	Context       json.RawMessage `json:"context"`
+	OutputSchema  json.RawMessage `json:"output_schema"`
+}
+
+// BuildPackage assembles a prepared package for useCase from context (whose
+// keys must match the use case's prompt template placeholders — see
+// ml/prompts/*.md).
+func (c *Client) BuildPackage(ctx context.Context, useCase string, packageContext map[string]any) (PackageBundle, error) {
+	var out PackageBundle
+	err := c.postJSON(ctx, "/package-build", buildPackageRequest{UseCase: useCase, Context: packageContext}, &out)
+	return out, err
+}
