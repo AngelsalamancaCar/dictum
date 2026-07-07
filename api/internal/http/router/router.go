@@ -11,13 +11,23 @@ import (
 
 	"dictum/api/internal/ingest"
 	"dictum/api/internal/jobs"
+	"dictum/api/internal/mlclient"
 	"dictum/api/internal/store"
 )
 
 // CaseStore is the subset of *store.Store the router needs.
 type CaseStore interface {
 	CreateCase(ctx context.Context, name string) (store.Case, error)
+	CaseChunkText(ctx context.Context, caseID uuid.UUID) (string, error)
 	ingest.DocumentStore
+}
+
+// RetrievalClient is the subset of *mlclient.Client the router needs for
+// UC2/UC3 (retrieval and classification are ML-worker-owned per plan.md's
+// architecture split; the router just builds a case summary and proxies).
+type RetrievalClient interface {
+	Similar(ctx context.Context, caseSummary string, k int, filters mlclient.SimilarFilters) ([]mlclient.SimilarResult, error)
+	ClassifyKNN(ctx context.Context, caseSummary string, k int) (mlclient.ClassifyKNNResult, error)
 }
 
 // Deps are the dependencies routes are built against; New wires them into
@@ -25,6 +35,7 @@ type CaseStore interface {
 type Deps struct {
 	Store CaseStore
 	Jobs  *jobs.Queue
+	ML    RetrievalClient
 }
 
 func New(deps Deps) *http.ServeMux {
@@ -33,6 +44,8 @@ func New(deps Deps) *http.ServeMux {
 	mux.HandleFunc("GET /healthz", healthz)
 	mux.HandleFunc("POST /api/cases", handleCreateCase(deps))
 	mux.HandleFunc("GET /api/cases/{id}/events", handleCaseEvents(deps))
+	mux.HandleFunc("GET /api/cases/{id}/similar-rulings", handleSimilarRulings(deps))
+	mux.HandleFunc("GET /api/cases/{id}/classification", handleClassification(deps))
 
 	return mux
 }
@@ -79,6 +92,70 @@ func ingestFolder(deps Deps, caseID uuid.UUID, folderPath string) {
 	})
 	if err != nil {
 		log.Printf("folder ingest failed for case %s (%s): %v", caseID, folderPath, err)
+	}
+}
+
+func handleSimilarRulings(deps Deps) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		caseID, err := uuid.Parse(r.PathValue("id"))
+		if err != nil {
+			http.Error(w, "invalid case id", http.StatusBadRequest)
+			return
+		}
+
+		summary, err := deps.Store.CaseChunkText(r.Context(), caseID)
+		if err != nil {
+			http.Error(w, "failed to load case text", http.StatusInternalServerError)
+			return
+		}
+		if summary == "" {
+			http.Error(w, "case has no parsed documents yet", http.StatusConflict)
+			return
+		}
+
+		filters := mlclient.SimilarFilters{
+			CaseType: r.URL.Query().Get("case_type"),
+			Court:    r.URL.Query().Get("court"),
+			DateFrom: r.URL.Query().Get("date_from"),
+			DateTo:   r.URL.Query().Get("date_to"),
+		}
+		results, err := deps.ML.Similar(r.Context(), summary, 10, filters)
+		if err != nil {
+			http.Error(w, "similarity search failed", http.StatusBadGateway)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(results)
+	}
+}
+
+func handleClassification(deps Deps) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		caseID, err := uuid.Parse(r.PathValue("id"))
+		if err != nil {
+			http.Error(w, "invalid case id", http.StatusBadRequest)
+			return
+		}
+
+		summary, err := deps.Store.CaseChunkText(r.Context(), caseID)
+		if err != nil {
+			http.Error(w, "failed to load case text", http.StatusInternalServerError)
+			return
+		}
+		if summary == "" {
+			http.Error(w, "case has no parsed documents yet", http.StatusConflict)
+			return
+		}
+
+		result, err := deps.ML.ClassifyKNN(r.Context(), summary, 10)
+		if err != nil {
+			http.Error(w, "classification failed", http.StatusBadGateway)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(result)
 	}
 }
 

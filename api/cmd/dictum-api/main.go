@@ -36,7 +36,7 @@ func main() {
 	ml := mlclient.New(mlURL)
 	queue := jobs.NewQueue(ml, db, 4)
 
-	mux := router.New(router.Deps{Store: db, Jobs: queue})
+	mux := router.New(router.Deps{Store: db, Jobs: queue, ML: ml})
 
 	log.Printf("dictum-api listening on %s", addr)
 	if err := http.ListenAndServe(addr, mux); err != nil {

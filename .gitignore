@@ -1,3 +1,13 @@
+# Claude Code
+CLAUDE.md
+.claude/
+
+# Data — corpus, exports, snapshots (never belongs in the repo; see plan.md
+# for how to (re)fetch/import it)
+corpus_archive/
+*.ndjson
+snapshots/
+
 # Go
 api/bin/
 *.exe
@@ -11,20 +21,20 @@ ml/__pycache__/
 .pytest_cache/
 *.egg-info/
 
-# Claude Code local state
-.claude/
-
 # Node
 web/node_modules/
 web/dist/
 
 # Env / secrets
 .env
+.env.*
 *.local
 
-# OS
+# Logs
+*.log
+
+# Editors / OS
+.vscode/
+.idea/
 .DS_Store
 Thumbs.db
-
-# Corpus archive is large and source-controlled separately from code history
-corpus_archive/embeddings.ndjson

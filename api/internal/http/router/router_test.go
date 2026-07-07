@@ -23,6 +23,7 @@ import (
 type fakeCaseStore struct {
 	mu        sync.Mutex
 	documents map[string]bool // sha256 -> exists
+	chunkText string
 }
 
 func newFakeCaseStore() *fakeCaseStore {
@@ -54,6 +55,10 @@ func (f *fakeCaseStore) InsertChunks(ctx context.Context, documentID uuid.UUID, 
 	return nil
 }
 
+func (f *fakeCaseStore) CaseChunkText(ctx context.Context, caseID uuid.UUID) (string, error) {
+	return f.chunkText, nil
+}
+
 // fakeML gates Parse on a channel so tests can subscribe to job events
 // before the pipeline races ahead of them.
 type fakeML struct {
@@ -69,6 +74,25 @@ func (f fakeML) Parse(ctx context.Context, filePath string) (mlclient.ParseResul
 
 func (fakeML) Embed(ctx context.Context, texts []string, kind string) ([][]float32, error) {
 	return [][]float32{{0.1, 0.2}}, nil
+}
+
+type fakeRetrieval struct {
+	similarResults []mlclient.SimilarResult
+	similarErr     error
+	classifyResult mlclient.ClassifyKNNResult
+	classifyErr    error
+
+	lastSummary string
+}
+
+func (f *fakeRetrieval) Similar(ctx context.Context, caseSummary string, k int, filters mlclient.SimilarFilters) ([]mlclient.SimilarResult, error) {
+	f.lastSummary = caseSummary
+	return f.similarResults, f.similarErr
+}
+
+func (f *fakeRetrieval) ClassifyKNN(ctx context.Context, caseSummary string, k int) (mlclient.ClassifyKNNResult, error) {
+	f.lastSummary = caseSummary
+	return f.classifyResult, f.classifyErr
 }
 
 func TestHandleCreateCase_ValidationErrors(t *testing.T) {
@@ -171,5 +195,84 @@ func TestHandleCaseEvents_StreamsSSEFormat(t *testing.T) {
 	got := string(buf[:n])
 	if !strings.HasPrefix(got, "data: ") || !strings.Contains(got, `"status":"parsing"`) {
 		t.Fatalf("unexpected SSE payload: %q", got)
+	}
+}
+
+func TestHandleSimilarRulings(t *testing.T) {
+	cs := newFakeCaseStore()
+	cs.chunkText = "hechos del caso: despido sin justificacion"
+	ml := &fakeRetrieval{similarResults: []mlclient.SimilarResult{
+		{RulingID: "r1", ExternalID: "sentencia_1.txt", Outcome: "upheld", FusedScore: 0.03},
+	}}
+	deps := Deps{Store: cs, ML: ml}
+	mux := New(deps)
+
+	caseID := uuid.New()
+	req := httptest.NewRequest(http.MethodGet, "/api/cases/"+caseID.String()+"/similar-rulings?case_type=despido+injustificado", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if ml.lastSummary != cs.chunkText {
+		t.Fatalf("expected case summary %q passed to ML client, got %q", cs.chunkText, ml.lastSummary)
+	}
+
+	var results []mlclient.SimilarResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &results); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+	if len(results) != 1 || results[0].ExternalID != "sentencia_1.txt" {
+		t.Fatalf("unexpected results: %+v", results)
+	}
+}
+
+func TestHandleSimilarRulings_NoDocumentsYet(t *testing.T) {
+	cs := newFakeCaseStore() // chunkText left empty: no parsed documents
+	deps := Deps{Store: cs, ML: &fakeRetrieval{}}
+	mux := New(deps)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/cases/"+uuid.New().String()+"/similar-rulings", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 for case with no parsed text, got %d", rec.Code)
+	}
+}
+
+func TestHandleClassification(t *testing.T) {
+	cs := newFakeCaseStore()
+	cs.chunkText = "hechos del caso: pago de utilidades no cubierto"
+	caseType := "pago de utilidades"
+	ml := &fakeRetrieval{classifyResult: mlclient.ClassifyKNNResult{
+		CaseType:   &caseType,
+		Confidence: 0.8,
+		Evidence: []mlclient.ClassifyEvidence{
+			{RulingID: "r2", ExternalID: "sentencia_2.txt", Similarity: 0.9},
+		},
+	}}
+	deps := Deps{Store: cs, ML: ml}
+	mux := New(deps)
+
+	caseID := uuid.New()
+	req := httptest.NewRequest(http.MethodGet, "/api/cases/"+caseID.String()+"/classification", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var result mlclient.ClassifyKNNResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+	if result.CaseType == nil || *result.CaseType != caseType {
+		t.Fatalf("unexpected case_type: %+v", result.CaseType)
+	}
+	if result.Confidence != 0.8 {
+		t.Fatalf("unexpected confidence: %v", result.Confidence)
 	}
 }
