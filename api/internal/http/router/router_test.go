@@ -13,7 +13,9 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/fstest"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -32,6 +34,10 @@ type fakeCaseStore struct {
 
 	packages       map[uuid.UUID]store.Package
 	packageResults map[uuid.UUID][]store.PackageResult
+	typologies     []store.Typology
+	rulings        []store.Ruling
+	drafts         []store.Draft
+	auditEntries   []store.AuditEntry
 }
 
 func newFakeCaseStore() *fakeCaseStore {
@@ -54,6 +60,10 @@ func (f *fakeCaseStore) CreatePackage(ctx context.Context, in store.PackageInput
 		Bundle:        in.Bundle,
 		RetryOf:       in.RetryOf,
 		CreatedAt:     time.Now(),
+	}
+	if in.CreatedBy != "" {
+		createdBy := in.CreatedBy
+		p.CreatedBy = &createdBy
 	}
 	f.packages[p.ID] = p
 	return p, nil
@@ -165,6 +175,99 @@ func (f *fakeCaseStore) CaseChunkText(ctx context.Context, caseID uuid.UUID) (st
 	return f.chunkText, nil
 }
 
+func (f *fakeCaseStore) ListTypologies(ctx context.Context) ([]store.Typology, error) {
+	return f.typologies, nil
+}
+
+func (f *fakeCaseStore) GetRulingsByIDs(ctx context.Context, ids []uuid.UUID) ([]store.Ruling, error) {
+	want := make(map[uuid.UUID]bool, len(ids))
+	for _, id := range ids {
+		want[id] = true
+	}
+	out := []store.Ruling{}
+	for _, r := range f.rulings {
+		if want[r.ID] {
+			out = append(out, r)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeCaseStore) CreateDraft(ctx context.Context, in store.DraftInput) (store.Draft, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	d := store.Draft{
+		ID:             uuid.New(),
+		CaseID:         in.CaseID,
+		PackageID:      in.PackageID,
+		GeneratedText:  in.GeneratedText,
+		CitedRulingIDs: in.CitedRulingIDs,
+		PromptVersion:  &in.PromptVersion,
+		CreatedAt:      time.Now(),
+	}
+	f.drafts = append(f.drafts, d)
+	return d, nil
+}
+
+func (f *fakeCaseStore) ListDraftsByCase(ctx context.Context, caseID uuid.UUID) ([]store.Draft, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := []store.Draft{}
+	for _, d := range f.drafts {
+		if d.CaseID == caseID {
+			out = append(out, d)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeCaseStore) InsertAudit(ctx context.Context, in store.AuditInput) (store.AuditEntry, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	e := store.AuditEntry{
+		ID:        uuid.New(),
+		Actor:     in.Actor,
+		Action:    in.Action,
+		Entity:    in.Entity,
+		EntityID:  in.EntityID,
+		Metadata:  in.Metadata,
+		CreatedAt: time.Now(),
+	}
+	f.auditEntries = append(f.auditEntries, e)
+	return e, nil
+}
+
+func (f *fakeCaseStore) ListAuditLog(ctx context.Context, filter store.AuditFilter) ([]store.AuditEntry, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := []store.AuditEntry{}
+	for _, e := range f.auditEntries {
+		if filter.Actor != "" && e.Actor != filter.Actor {
+			continue
+		}
+		if filter.Entity != "" && e.Entity != filter.Entity {
+			continue
+		}
+		if filter.EntityID != nil && (e.EntityID == nil || *e.EntityID != *filter.EntityID) {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out, nil
+}
+
+// auditActions returns the recorded (action, entity) pairs in order, for
+// asserting coverage without coupling tests to metadata details.
+func (f *fakeCaseStore) auditActions() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, 0, len(f.auditEntries))
+	for _, e := range f.auditEntries {
+		out = append(out, e.Action+" "+e.Entity)
+	}
+	return out
+}
+
 // fakeML gates Parse on a channel so tests can subscribe to job events
 // before the pipeline races ahead of them.
 type fakeML struct {
@@ -187,6 +290,10 @@ type fakeRetrieval struct {
 	similarErr     error
 	classifyResult mlclient.ClassifyKNNResult
 	classifyErr    error
+	riskResult     mlclient.RiskScoreResult
+	riskErr        error
+	revertedResult []mlclient.RevertedNeighbor
+	revertedErr    error
 	buildResult    mlclient.PackageBundle
 	buildErr       error
 
@@ -203,6 +310,16 @@ func (f *fakeRetrieval) Similar(ctx context.Context, caseSummary string, k int, 
 func (f *fakeRetrieval) ClassifyKNN(ctx context.Context, caseSummary string, k int) (mlclient.ClassifyKNNResult, error) {
 	f.lastSummary = caseSummary
 	return f.classifyResult, f.classifyErr
+}
+
+func (f *fakeRetrieval) RiskScore(ctx context.Context, text string, k int) (mlclient.RiskScoreResult, error) {
+	f.lastSummary = text
+	return f.riskResult, f.riskErr
+}
+
+func (f *fakeRetrieval) RevertedNeighbors(ctx context.Context, text string, k int) ([]mlclient.RevertedNeighbor, error) {
+	f.lastSummary = text
+	return f.revertedResult, f.revertedErr
 }
 
 func (f *fakeRetrieval) BuildPackage(ctx context.Context, useCase string, packageContext map[string]any) (mlclient.PackageBundle, error) {
@@ -393,6 +510,61 @@ func TestHandleClassification(t *testing.T) {
 	}
 }
 
+func TestHandleRiskScore(t *testing.T) {
+	cs := newFakeCaseStore()
+	cs.chunkText = "hechos del caso: despido sin causa justificada"
+	risk := 0.72
+	bucket := "high"
+	ml := &fakeRetrieval{riskResult: mlclient.RiskScoreResult{
+		Risk:       &risk,
+		Bucket:     &bucket,
+		SampleSize: 5,
+		Neighbors: []mlclient.RiskNeighbor{
+			{RulingID: "r3", ExternalID: "sentencia_3.txt", Outcome: "reverted", Similarity: 0.85},
+		},
+	}}
+	deps := Deps{Store: cs, ML: ml}
+	mux := New(deps)
+
+	caseID := uuid.New()
+	req := httptest.NewRequest(http.MethodGet, "/api/cases/"+caseID.String()+"/risk-score", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var result mlclient.RiskScoreResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+	if result.Bucket == nil || *result.Bucket != bucket {
+		t.Fatalf("unexpected bucket: %+v", result.Bucket)
+	}
+	if result.SampleSize != 5 {
+		t.Fatalf("unexpected sample_size: %v", result.SampleSize)
+	}
+	if ml.lastSummary != cs.chunkText {
+		t.Fatalf("expected case chunk text to be scored, got %q", ml.lastSummary)
+	}
+}
+
+func TestHandleRiskScore_NoParsedText(t *testing.T) {
+	cs := newFakeCaseStore()
+	deps := Deps{Store: cs, ML: &fakeRetrieval{}}
+	mux := New(deps)
+
+	caseID := uuid.New()
+	req := httptest.NewRequest(http.MethodGet, "/api/cases/"+caseID.String()+"/risk-score", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 for case with no parsed text, got %d", rec.Code)
+	}
+}
+
 // classifySchemaJSON is a minimal output_schema fixture (a trimmed version
 // of ml/prompts/schemas/classify.output_schema.json) for exercising
 // package-result validation without needing the real prompt bundle.
@@ -479,6 +651,342 @@ func TestHandleCreatePackage_BuildFailureIsBadGateway(t *testing.T) {
 
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("expected 502, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleCreateClassifyPackage_AssemblesContextFromStore(t *testing.T) {
+	cs := newFakeCaseStore()
+	cs.chunkText = "hechos del caso: despido sin causa justificada"
+	description := "El trabajador alega despido sin causa."
+	cs.typologies = []store.Typology{
+		{
+			Name:                   "despido injustificado",
+			Description:            &description,
+			DiscriminatingFeatures: json.RawMessage(`["negación del despido"]`),
+		},
+	}
+	ml := &fakeRetrieval{buildResult: classifyBundle(t, map[string]any{})}
+	deps := Deps{Store: cs, ML: ml}
+	mux := New(deps)
+
+	caseID := uuid.New()
+	req := httptest.NewRequest(http.MethodPost, "/api/cases/"+caseID.String()+"/packages/classify", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var pkg store.Package
+	if err := json.Unmarshal(rec.Body.Bytes(), &pkg); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+	if pkg.CaseID != caseID || pkg.UseCase != "classify" {
+		t.Fatalf("unexpected package: %+v", pkg)
+	}
+
+	if ml.lastUseCase != "classify" {
+		t.Fatalf("expected ML.BuildPackage called with classify, got %q", ml.lastUseCase)
+	}
+	if ml.lastContext["case_summary"] != cs.chunkText {
+		t.Fatalf("expected case_summary to be the case's chunk text, got %v", ml.lastContext["case_summary"])
+	}
+	catalog, ok := ml.lastContext["typology_catalog"].([]typologyCatalogEntry)
+	if !ok || len(catalog) != 1 {
+		t.Fatalf("expected one typology_catalog entry, got %#v", ml.lastContext["typology_catalog"])
+	}
+	if catalog[0].Name != "despido injustificado" || catalog[0].Description != description {
+		t.Fatalf("unexpected catalog entry: %+v", catalog[0])
+	}
+	if len(catalog[0].DiscriminatingFeatures) != 1 || catalog[0].DiscriminatingFeatures[0] != "negación del despido" {
+		t.Fatalf("unexpected discriminating_features: %+v", catalog[0].DiscriminatingFeatures)
+	}
+}
+
+func TestHandleCreateClassifyPackage_NoParsedText(t *testing.T) {
+	cs := newFakeCaseStore()
+	deps := Deps{Store: cs, ML: &fakeRetrieval{}}
+	mux := New(deps)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/cases/"+uuid.New().String()+"/packages/classify", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 for case with no parsed text, got %d", rec.Code)
+	}
+}
+
+func TestHandleCreateRiskExplainPackage_AssemblesContextFromNeighbors(t *testing.T) {
+	cs := newFakeCaseStore()
+	cs.chunkText = "hechos del caso: despido sin causa justificada"
+	reason := "falta de acreditación de la causa de rescisión"
+	ml := &fakeRetrieval{
+		revertedResult: []mlclient.RevertedNeighbor{
+			{RulingID: "r9", ExternalID: "sentencia_9.txt", RevertReason: &reason, Similarity: 0.88},
+		},
+		buildResult: classifyBundle(t, map[string]any{}),
+	}
+	deps := Deps{Store: cs, ML: ml}
+	mux := New(deps)
+
+	caseID := uuid.New()
+	req := httptest.NewRequest(http.MethodPost, "/api/cases/"+caseID.String()+"/packages/risk-explain", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var pkg store.Package
+	if err := json.Unmarshal(rec.Body.Bytes(), &pkg); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+	if pkg.CaseID != caseID || pkg.UseCase != "risk_explain" {
+		t.Fatalf("unexpected package: %+v", pkg)
+	}
+
+	if ml.lastUseCase != "risk_explain" {
+		t.Fatalf("expected ML.BuildPackage called with risk_explain, got %q", ml.lastUseCase)
+	}
+	if ml.lastContext["draft_text"] != cs.chunkText {
+		t.Fatalf("expected draft_text to be the case's chunk text, got %v", ml.lastContext["draft_text"])
+	}
+	neighbors, ok := ml.lastContext["reverted_neighbors"].([]revertedNeighborEntry)
+	if !ok || len(neighbors) != 1 {
+		t.Fatalf("expected one reverted_neighbors entry, got %#v", ml.lastContext["reverted_neighbors"])
+	}
+	if neighbors[0].RulingID != "r9" || neighbors[0].RevertReason == nil || *neighbors[0].RevertReason != reason {
+		t.Fatalf("unexpected neighbor entry: %+v", neighbors[0])
+	}
+}
+
+func TestHandleCreateRiskExplainPackage_NoParsedText(t *testing.T) {
+	cs := newFakeCaseStore()
+	deps := Deps{Store: cs, ML: &fakeRetrieval{}}
+	mux := New(deps)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/cases/"+uuid.New().String()+"/packages/risk-explain", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 for case with no parsed text, got %d", rec.Code)
+	}
+}
+
+func TestTruncateExcerpt_DoesNotSplitMultibyteRune(t *testing.T) {
+	// "ó" is 2 bytes in UTF-8 (0xC3 0xB3); place one exactly straddling the
+	// cut point so a naive byte-index slice would split it.
+	text := strings.Repeat("x", exemplarExcerptLen-1) + "ó" + strings.Repeat("y", 10)
+	got := truncateExcerpt(text)
+	if !utf8.ValidString(got) {
+		t.Fatalf("truncated excerpt is not valid UTF-8: %q", got)
+	}
+	if strings.Contains(got, "�") {
+		t.Fatalf("truncated excerpt contains a replacement character: %q", got)
+	}
+}
+
+func TestTruncateExcerpt_ShortTextUnchanged(t *testing.T) {
+	if got := truncateExcerpt("texto corto"); got != "texto corto" {
+		t.Fatalf("expected short text unchanged, got %q", got)
+	}
+}
+
+func TestHandleCreateDraftPackage_AssemblesContextFromNeighbors(t *testing.T) {
+	cs := newFakeCaseStore()
+	cs.chunkText = "hechos del caso: despido sin causa justificada"
+	description := "El trabajador alega despido sin causa."
+	cs.typologies = []store.Typology{
+		{
+			Name:                   "despido injustificado",
+			Description:            &description,
+			DiscriminatingFeatures: json.RawMessage(`["negación del despido"]`),
+		},
+	}
+	upheldID, revertedID := uuid.New(), uuid.New()
+	longText := strings.Repeat("x", exemplarExcerptLen+50)
+	cs.rulings = []store.Ruling{
+		{ID: upheldID, ExternalID: "sentencia_upheld.txt", Outcome: "upheld", FullText: longText},
+		{ID: revertedID, ExternalID: "sentencia_reverted.txt", Outcome: "reverted", FullText: "texto corto"},
+	}
+
+	ml := &fakeRetrieval{
+		similarResults: []mlclient.SimilarResult{
+			{RulingID: revertedID.String(), ExternalID: "sentencia_reverted.txt", Outcome: "reverted", FusedScore: 0.9},
+			{RulingID: upheldID.String(), ExternalID: "sentencia_upheld.txt", Outcome: "upheld", FusedScore: 0.8},
+		},
+		buildResult: classifyBundle(t, map[string]any{}),
+	}
+	deps := Deps{Store: cs, ML: ml}
+	mux := New(deps)
+
+	caseID := uuid.New()
+	body, _ := json.Marshal(createDraftPackageRequest{CaseType: "despido injustificado"})
+	req := httptest.NewRequest(http.MethodPost, "/api/cases/"+caseID.String()+"/packages/draft", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var pkg store.Package
+	if err := json.Unmarshal(rec.Body.Bytes(), &pkg); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+	if pkg.CaseID != caseID || pkg.UseCase != "draft" {
+		t.Fatalf("unexpected package: %+v", pkg)
+	}
+
+	if ml.lastUseCase != "draft" {
+		t.Fatalf("expected ML.BuildPackage called with draft, got %q", ml.lastUseCase)
+	}
+	if ml.lastContext["case_type"] != "despido injustificado" {
+		t.Fatalf("unexpected case_type: %v", ml.lastContext["case_type"])
+	}
+	if ml.lastContext["case_facts"] != cs.chunkText {
+		t.Fatalf("expected case_facts to be the case's chunk text, got %v", ml.lastContext["case_facts"])
+	}
+	structure, ok := ml.lastContext["typology_structure"].(typologyStructureEntry)
+	if !ok || structure.Name != "despido injustificado" || structure.Description != description {
+		t.Fatalf("unexpected typology_structure: %#v", ml.lastContext["typology_structure"])
+	}
+
+	exemplars, ok := ml.lastContext["exemplar_rulings"].([]exemplarRulingEntry)
+	if !ok || len(exemplars) != 2 {
+		t.Fatalf("expected two exemplar_rulings entries, got %#v", ml.lastContext["exemplar_rulings"])
+	}
+	// upheld exemplar must be sorted first even though it ranked second in
+	// the similarity results (plan.md §4 UC4: "preferably upheld").
+	if exemplars[0].RulingID != upheldID.String() || exemplars[0].Outcome != "upheld" {
+		t.Fatalf("expected upheld exemplar first, got %+v", exemplars[0])
+	}
+	if len(exemplars[0].Excerpt) != exemplarExcerptLen+len("…") {
+		t.Fatalf("expected excerpt truncated to %d chars, got %d", exemplarExcerptLen, len(exemplars[0].Excerpt))
+	}
+	if exemplars[1].RulingID != revertedID.String() || exemplars[1].Excerpt != "texto corto" {
+		t.Fatalf("expected untruncated short excerpt for second exemplar, got %+v", exemplars[1])
+	}
+}
+
+func TestHandleCreateDraftPackage_UnknownCaseType(t *testing.T) {
+	cs := newFakeCaseStore()
+	cs.chunkText = "hechos del caso"
+	deps := Deps{Store: cs, ML: &fakeRetrieval{}}
+	mux := New(deps)
+
+	body, _ := json.Marshal(createDraftPackageRequest{CaseType: "tipo inexistente"})
+	req := httptest.NewRequest(http.MethodPost, "/api/cases/"+uuid.New().String()+"/packages/draft", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for unknown case_type, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleCreateDraftPackage_NoParsedText(t *testing.T) {
+	cs := newFakeCaseStore()
+	deps := Deps{Store: cs, ML: &fakeRetrieval{}}
+	mux := New(deps)
+
+	body, _ := json.Marshal(createDraftPackageRequest{CaseType: "despido injustificado"})
+	req := httptest.NewRequest(http.MethodPost, "/api/cases/"+uuid.New().String()+"/packages/draft", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 for case with no parsed text, got %d", rec.Code)
+	}
+}
+
+var draftSchemaJSON = []byte(`{
+	"type": "object",
+	"required": ["sections", "cited_ruling_ids"],
+	"properties": {
+		"sections": {
+			"type": "array",
+			"items": {
+				"type": "object",
+				"required": ["label", "text"],
+				"properties": {"label": {"type": "string"}, "text": {"type": "string"}},
+				"additionalProperties": false
+			}
+		},
+		"cited_ruling_ids": {"type": "array", "items": {"type": "string"}}
+	},
+	"additionalProperties": false
+}`)
+
+func draftBundle(t *testing.T, context map[string]any) mlclient.PackageBundle {
+	t.Helper()
+	contextJSON, err := json.Marshal(context)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return mlclient.PackageBundle{
+		PackageID:     "pkg-draft",
+		UseCase:       "draft",
+		PromptVersion: 1,
+		CreatedAt:     "2026-01-01T00:00:00Z",
+		Prompt:        "rendered draft prompt",
+		Context:       contextJSON,
+		OutputSchema:  draftSchemaJSON,
+	}
+}
+
+func TestHandleAttachPackageResult_DraftUseCaseWritesDraftRow(t *testing.T) {
+	cs := newFakeCaseStore()
+	ml := &fakeRetrieval{buildResult: draftBundle(t, map[string]any{"case_type": "despido injustificado"})}
+	deps := Deps{Store: cs, ML: ml}
+	mux := New(deps)
+
+	caseID := uuid.New()
+	body, _ := json.Marshal(createPackageRequest{UseCase: "draft", Context: map[string]any{"case_type": "despido injustificado"}})
+	createReq := httptest.NewRequest(http.MethodPost, "/api/cases/"+caseID.String()+"/packages", bytes.NewReader(body))
+	createRec := httptest.NewRecorder()
+	mux.ServeHTTP(createRec, createReq)
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("expected 201 creating draft package, got %d: %s", createRec.Code, createRec.Body.String())
+	}
+	var pkg store.Package
+	if err := json.Unmarshal(createRec.Body.Bytes(), &pkg); err != nil {
+		t.Fatal(err)
+	}
+
+	submitRec := httptest.NewRecorder()
+	mux.ServeHTTP(submitRec, httptest.NewRequest(http.MethodPost, "/api/packages/"+pkg.ID.String()+"/submit", nil))
+	if submitRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 submitting, got %d: %s", submitRec.Code, submitRec.Body.String())
+	}
+
+	citedID := uuid.New()
+	rawResult := json.RawMessage(`{"sections":[{"label":"RESULTANDO","text":"primer resultando"},{"label":"CONSIDERANDO","text":"segundo"}],"cited_ruling_ids":["` + citedID.String() + `","not-a-uuid"]}`)
+	resultBody, _ := json.Marshal(attachPackageResultRequest{RawResponse: rawResult})
+	resultReq := httptest.NewRequest(http.MethodPost, "/api/packages/"+pkg.ID.String()+"/results", bytes.NewReader(resultBody))
+	resultRec := httptest.NewRecorder()
+	mux.ServeHTTP(resultRec, resultReq)
+	if resultRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 attaching valid result, got %d: %s", resultRec.Code, resultRec.Body.String())
+	}
+
+	drafts, err := cs.ListDraftsByCase(context.Background(), caseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(drafts) != 1 {
+		t.Fatalf("expected one draft written, got %d", len(drafts))
+	}
+	d := drafts[0]
+	if !strings.Contains(d.GeneratedText, "RESULTANDO") || !strings.Contains(d.GeneratedText, "primer resultando") {
+		t.Fatalf("unexpected generated_text: %q", d.GeneratedText)
+	}
+	if len(d.CitedRulingIDs) != 1 || d.CitedRulingIDs[0] != citedID {
+		t.Fatalf("expected only the valid uuid to be kept as cited_ruling_ids, got %v", d.CitedRulingIDs)
+	}
+	if d.PackageID == nil || *d.PackageID != pkg.ID {
+		t.Fatalf("expected draft to carry package provenance, got %+v", d.PackageID)
 	}
 }
 
@@ -735,5 +1243,160 @@ func TestHandleCancelPackage(t *testing.T) {
 	mux.ServeHTTP(againRec, httptest.NewRequest(http.MethodPost, "/api/packages/"+pkg.ID.String()+"/cancel", nil))
 	if againRec.Code != http.StatusConflict {
 		t.Fatalf("expected 409 cancelling an already-cancelled package, got %d", againRec.Code)
+	}
+}
+
+func TestRouter_NilStaticFS_RootIsNotFound(t *testing.T) {
+	cs := newFakeCaseStore()
+	mux := New(Deps{Store: cs, ML: &fakeRetrieval{}})
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for / with no StaticFS configured, got %d", rec.Code)
+	}
+}
+
+func TestRouter_StaticFS_ServesAssetsAndSPAFallback(t *testing.T) {
+	fsys := fstest.MapFS{
+		"index.html":          &fstest.MapFile{Data: []byte("<html>spa</html>")},
+		"assets/index-abc.js": &fstest.MapFile{Data: []byte("console.log('hi')")},
+	}
+	cs := newFakeCaseStore()
+	mux := New(Deps{Store: cs, ML: &fakeRetrieval{}, StaticFS: fsys})
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/assets/index-abc.js", nil))
+	if rec.Code != http.StatusOK || rec.Body.String() != "console.log('hi')" {
+		t.Fatalf("expected asset to be served as-is, got %d: %q", rec.Code, rec.Body.String())
+	}
+
+	// A client-side route with no matching file falls back to index.html
+	// instead of 404ing, so a hard refresh on e.g. /packages/42 still works.
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/packages/42", nil))
+	if rec.Code != http.StatusOK || rec.Body.String() != "<html>spa</html>" {
+		t.Fatalf("expected SPA fallback to index.html, got %d: %q", rec.Code, rec.Body.String())
+	}
+
+	// API routes still win over the catch-all static handler.
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if rec.Code != http.StatusOK || rec.Body.String() != "ok" {
+		t.Fatalf("expected /healthz to be handled by its own route, got %d: %q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestRouter_AuthGatesAPIRoutesOnly(t *testing.T) {
+	fsys := fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("<html>spa</html>")}}
+	cs := newFakeCaseStore()
+	mux := New(Deps{
+		Store:      cs,
+		ML:         &fakeRetrieval{},
+		StaticFS:   fsys,
+		AuthTokens: map[string]string{"secret1": "alice"},
+	})
+
+	// /api without a token → 401.
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/packages", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 without token, got %d", rec.Code)
+	}
+
+	// /api with the right bearer token → through to the handler.
+	req := httptest.NewRequest(http.MethodGet, "/api/packages", nil)
+	req.Header.Set("Authorization", "Bearer secret1")
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 with valid token, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// ?access_token= works too (SSE / download links can't set headers).
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/packages?access_token=secret1", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 with query-param token, got %d", rec.Code)
+	}
+
+	// /healthz and the SPA stay open — probes and the login surface must
+	// load without credentials.
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected /healthz open without token, got %d", rec.Code)
+	}
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected SPA open without token, got %d", rec.Code)
+	}
+}
+
+func TestAudit_PackageLifecycleRecordsActorAndActions(t *testing.T) {
+	cs := newFakeCaseStore()
+	context := map[string]any{"case_summary": "x", "typology_catalog": []any{}}
+	ml := &fakeRetrieval{buildResult: classifyBundle(t, context)}
+	mux := New(Deps{Store: cs, ML: ml, AuthTokens: map[string]string{"secret1": "alice"}})
+
+	authed := func(method, path string, body []byte) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer secret1")
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		return rec
+	}
+
+	caseID := uuid.New()
+	body, _ := json.Marshal(createPackageRequest{UseCase: "classify", Context: context})
+	createRec := authed(http.MethodPost, "/api/cases/"+caseID.String()+"/packages", body)
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("expected 201 creating package, got %d: %s", createRec.Code, createRec.Body.String())
+	}
+	var pkg store.Package
+	if err := json.Unmarshal(createRec.Body.Bytes(), &pkg); err != nil {
+		t.Fatal(err)
+	}
+	if pkg.CreatedBy == nil || *pkg.CreatedBy != "alice" {
+		t.Fatalf("expected package created_by alice, got %v", pkg.CreatedBy)
+	}
+
+	if rec := authed(http.MethodPost, "/api/packages/"+pkg.ID.String()+"/submit", nil); rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 submitting, got %d", rec.Code)
+	}
+	resultBody, _ := json.Marshal(attachPackageResultRequest{RawResponse: json.RawMessage(`{"case_type":"x"}`)})
+	if rec := authed(http.MethodPost, "/api/packages/"+pkg.ID.String()+"/results", resultBody); rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 attaching result, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	wantActions := []string{"create package", "submit package", "result_attach package"}
+	gotActions := cs.auditActions()
+	if len(gotActions) != len(wantActions) {
+		t.Fatalf("expected audit actions %v, got %v", wantActions, gotActions)
+	}
+	for i, want := range wantActions {
+		if gotActions[i] != want {
+			t.Fatalf("audit action %d: expected %q, got %q (all: %v)", i, want, gotActions[i], gotActions)
+		}
+	}
+	for _, e := range cs.auditEntries {
+		if e.Actor != "alice" {
+			t.Fatalf("expected every audit entry attributed to alice, got %q", e.Actor)
+		}
+	}
+
+	// GET /api/audit returns the trail, filterable by entity_id.
+	listRec := authed(http.MethodGet, "/api/audit?entity=package&entity_id="+pkg.ID.String(), nil)
+	if listRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 listing audit log, got %d", listRec.Code)
+	}
+	var entries []store.AuditEntry
+	if err := json.Unmarshal(listRec.Body.Bytes(), &entries); err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("expected 3 audit entries for the package, got %d", len(entries))
 	}
 }

@@ -216,6 +216,66 @@ func (c *Client) ClassifyKNN(ctx context.Context, caseSummary string, k int) (Cl
 	return out, err
 }
 
+type riskScoreRequest struct {
+	Text string `json:"text"`
+	K    int    `json:"k"`
+}
+
+type RiskNeighbor struct {
+	RulingID     string  `json:"ruling_id"`
+	ExternalID   string  `json:"external_id"`
+	Outcome      string  `json:"outcome"`
+	RevertReason *string `json:"revert_reason"`
+	Similarity   float64 `json:"similarity"`
+}
+
+type RiskScoreResult struct {
+	Risk       *float64       `json:"risk"`
+	Bucket     *string        `json:"bucket"`
+	SampleSize int            `json:"sample_size"`
+	Caveat     *string        `json:"caveat"`
+	Neighbors  []RiskNeighbor `json:"neighbors"`
+}
+
+// RiskScore runs UC5's local score signal (similarity-weighted reverted
+// ratio over the text's nearest outcome-tagged rulings, see
+// ml/risk/score.py) — no LLM call. text is typically a case summary or
+// draft; drafts (UC4) don't exist yet, so callers today pass the same
+// case-chunk-text stand-in /similar and /classify-knn use.
+func (c *Client) RiskScore(ctx context.Context, text string, k int) (RiskScoreResult, error) {
+	var out RiskScoreResult
+	err := c.postJSON(ctx, "/risk-score", riskScoreRequest{Text: text, K: k}, &out)
+	return out, err
+}
+
+type revertedNeighborsRequest struct {
+	Text string `json:"text"`
+	K    int    `json:"k"`
+}
+
+type RevertedNeighbor struct {
+	RulingID     string  `json:"ruling_id"`
+	ExternalID   string  `json:"external_id"`
+	RevertReason *string `json:"revert_reason"`
+	Similarity   float64 `json:"similarity"`
+}
+
+type revertedNeighborsResponse struct {
+	Neighbors []RevertedNeighbor `json:"neighbors"`
+}
+
+// RevertedNeighbors fetches the nearest rulings tagged `reverted` to text
+// (see ml/risk/score.py's nearest_reverted) — backs the UC5 risk_explain
+// package's {{reverted_neighbors}} context, narrower than RiskScore's mixed
+// upheld/reverted neighbor set.
+func (c *Client) RevertedNeighbors(ctx context.Context, text string, k int) ([]RevertedNeighbor, error) {
+	var out revertedNeighborsResponse
+	if err := c.postJSON(ctx, "/reverted-neighbors", revertedNeighborsRequest{Text: text, K: k}, &out); err != nil {
+		return nil, err
+	}
+	return out.Neighbors, nil
+}
+
 type buildPackageRequest struct {
 	UseCase string         `json:"use_case"`
 	Context map[string]any `json:"context"`

@@ -32,11 +32,14 @@ services:
 
   api:
     build:
-      context: ./api
+      context: .
+      dockerfile: api/Dockerfile
     environment:
       DICTUM_API_ADDR: ":8080"
       DATABASE_URL: postgresql://dictum:dictum@postgres:5432/dictum
       ML_WORKER_URL: http://ml:8000
+      # "actor:token,actor:token" — empty disables API auth (dev only).
+      DICTUM_API_TOKENS: ${DICTUM_API_TOKENS:-}
     ports:
       - "8080:8080"
     depends_on:

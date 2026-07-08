@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/pgvector/pgvector-go"
 )
 
@@ -58,4 +59,43 @@ func (s *Store) UpsertRuling(ctx context.Context, r RulingInput) error {
 		r.ExternalID, r.Text, r.CaseType, r.Outcome, r.RevertReason, r.Court, date, tagsJSON, pgvector.NewVector(r.Embedding),
 	)
 	return err
+}
+
+// Ruling is a row from the rulings table, fetched by id — used to pull the
+// full text of UC3-retrieved exemplar rulings for UC4 draft context (the
+// exemplar_rulings placeholder needs real citable text, not just metadata).
+type Ruling struct {
+	ID         uuid.UUID
+	ExternalID string
+	CaseType   *string
+	Outcome    string
+	Court      *string
+	FullText   string
+}
+
+// GetRulingsByIDs fetches full rows for a set of ruling ids, in no
+// particular order (callers that need a specific order re-sort by id).
+func (s *Store) GetRulingsByIDs(ctx context.Context, ids []uuid.UUID) ([]Ruling, error) {
+	if len(ids) == 0 {
+		return []Ruling{}, nil
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, external_id, case_type, outcome, court, full_text
+		FROM rulings
+		WHERE id = ANY($1)
+	`, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []Ruling{}
+	for rows.Next() {
+		var r Ruling
+		if err := rows.Scan(&r.ID, &r.ExternalID, &r.CaseType, &r.Outcome, &r.Court, &r.FullText); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }

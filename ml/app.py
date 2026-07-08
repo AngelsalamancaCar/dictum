@@ -8,9 +8,10 @@ from pydantic import BaseModel
 
 from parsing.liteparse_service import parse_document
 from rag.chunking import chunk_document
-from rag.embedding_service import embed_passages, embed_queries
+from rag.embedding_service import embed_passages, embed_queries, embed_query_pooled
 from rag.retrieval import Filters, hybrid_search
 from classify.knn import classify_by_knn
+from risk.score import nearest_reverted, score_by_knn
 from packager.bundle import build_bundle
 
 app = FastAPI(title="dictum-ml")
@@ -97,7 +98,7 @@ class ClassifyKNNResponse(BaseModel):
 
 @app.post("/classify-knn", response_model=ClassifyKNNResponse)
 def classify_knn(req: ClassifyKNNRequest):
-    query_vec = embed_queries([req.case_summary])[0]
+    query_vec = embed_query_pooled(req.case_summary)
     result = classify_by_knn(query_vec, k=req.k)
     return ClassifyKNNResponse(
         case_type=result["case_type"],
@@ -136,7 +137,7 @@ class SimilarResponse(BaseModel):
 
 @app.post("/similar", response_model=SimilarResponse)
 def similar(req: SimilarRequest):
-    query_vec = embed_queries([req.case_summary])[0]
+    query_vec = embed_query_pooled(req.case_summary)
     filters = Filters(
         case_type=req.case_type, court=req.court, date_from=req.date_from, date_to=req.date_to
     )
@@ -157,9 +158,83 @@ def similar(req: SimilarRequest):
     )
 
 
-@app.post("/risk-score")
-def risk_score():
-    raise NotImplementedError
+class RiskScoreRequest(BaseModel):
+    text: str
+    k: int = 10
+
+
+class RiskScoreNeighbor(BaseModel):
+    ruling_id: str
+    external_id: str
+    outcome: str
+    revert_reason: str | None
+    similarity: float
+
+
+class RiskScoreResponse(BaseModel):
+    risk: float | None
+    bucket: Literal["low", "medium", "high"] | None
+    sample_size: int
+    caveat: str | None
+    neighbors: list[RiskScoreNeighbor]
+
+
+@app.post("/risk-score", response_model=RiskScoreResponse)
+def risk_score(req: RiskScoreRequest):
+    query_vec = embed_query_pooled(req.text)
+    result = score_by_knn(query_vec, k=req.k)
+    return RiskScoreResponse(
+        risk=result["risk"],
+        bucket=result["bucket"],
+        sample_size=result["sample_size"],
+        caveat=result["caveat"],
+        neighbors=[
+            RiskScoreNeighbor(
+                ruling_id=str(n["id"]),
+                external_id=n["external_id"],
+                outcome=n["outcome"],
+                revert_reason=n.get("revert_reason"),
+                similarity=n["similarity"],
+            )
+            for n in result["neighbors"]
+        ],
+    )
+
+
+class RevertedNeighborsRequest(BaseModel):
+    text: str
+    k: int = 5
+
+
+class RevertedNeighbor(BaseModel):
+    ruling_id: str
+    external_id: str
+    revert_reason: str | None
+    similarity: float
+
+
+class RevertedNeighborsResponse(BaseModel):
+    neighbors: list[RevertedNeighbor]
+
+
+@app.post("/reverted-neighbors", response_model=RevertedNeighborsResponse)
+def reverted_neighbors(req: RevertedNeighborsRequest):
+    """Backs the UC5 risk_explain package's {{reverted_neighbors}} context —
+    narrower than /risk-score's mixed upheld/reverted neighbors, since an
+    explanation only ever cites rulings that were actually overturned."""
+    query_vec = embed_query_pooled(req.text)
+    neighbors = nearest_reverted(query_vec, k=req.k)
+    return RevertedNeighborsResponse(
+        neighbors=[
+            RevertedNeighbor(
+                ruling_id=str(n["id"]),
+                external_id=n["external_id"],
+                revert_reason=n.get("revert_reason"),
+                similarity=n["similarity"],
+            )
+            for n in neighbors
+        ]
+    )
 
 
 class PackageBuildRequest(BaseModel):

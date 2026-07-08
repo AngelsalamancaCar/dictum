@@ -47,7 +47,7 @@ def vector_search(query_embedding: np.ndarray, k: int, filters: Filters | None =
     params.update({"q": query_embedding, "k": k})
 
     sql = f"""
-        SELECT id, external_id, case_type, outcome, court, date,
+        SELECT id, external_id, case_type, outcome, revert_reason, court, date,
                1 - (embedding <=> %(q)s) AS similarity
         FROM rulings
         WHERE embedding IS NOT NULL
