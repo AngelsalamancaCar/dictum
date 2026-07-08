@@ -1,6 +1,7 @@
 # Claude Code
 CLAUDE.md
 .claude/
+plan.md
 
 # Data — corpus, exports, snapshots (never belongs in the repo; see plan.md
 # for how to (re)fetch/import it)
